@@ -16,7 +16,7 @@ st.set_page_config(page_title="Low-Latency Voice Assistant", page_icon="⚡")
 st.title("⚡ Low-Latency Voice Assistant")
 st.caption("Speak, and get a spoken reply back — every stage is timed so the latency claim is measured, not just asserted.")
 
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]  # tried in order; falls back on 503/overload
 RIME_MODEL = "mistv3"  # Rime's fastest, lowest-latency English model
 RIME_TTS_URL = "https://users.rime.ai/v1/rime-tts"
 RIME_VOICES_URL = "https://users.rime.ai/data/voices/voice_details.json"
@@ -187,6 +187,44 @@ def synthesize_speech(text: str) -> tuple[bytes | None, float]:
         return None, (time.perf_counter() - t_start) * 1000
 
 
+def call_gemini(history_contents, current_turn_content, reply_prompt):
+    """
+    Try each model in GEMINI_MODELS in order. For each model, retry a couple
+    times on transient 503/UNAVAILABLE (high demand) errors with backoff
+    before falling through to the next model. Returns (parsed_json_or_None,
+    model_used_or_None, error_message_or_None).
+    """
+    last_error = None
+    for model_name in GEMINI_MODELS:
+        max_retries = 2  # per-model retries before falling back to next model
+        for attempt in range(max_retries):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=history_contents + [current_turn_content],
+                    config=types.GenerateContentConfig(
+                        system_instruction=reply_prompt,
+                        temperature=0.4,
+                        max_output_tokens=120,
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                return json.loads(response.text), model_name, None
+            except Exception as e:
+                last_error = e
+                is_overloaded = "503" in str(e) or "UNAVAILABLE" in str(e)
+                is_not_found = "404" in str(e) or "NOT_FOUND" in str(e)
+                if is_overloaded and attempt < max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))  # 1.5s, then 3s
+                    continue
+                if is_overloaded or is_not_found:
+                    break  # stop retrying this model, fall through to next model
+                # Unknown error type — don't keep hammering, surface it now
+                return None, None, str(e)
+    return None, None, str(last_error)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar: speech provider status + conversation switcher
 # ---------------------------------------------------------------------------
@@ -285,22 +323,11 @@ if audio_value is not None:
                 ],
             )
 
-            try:
-                response = gemini_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=history_contents + [current_turn_content],
-                    config=types.GenerateContentConfig(
-                        system_instruction=reply_prompt,
-                        temperature=0.4,
-                        max_output_tokens=120,
-                        response_mime_type="application/json",
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                parsed = json.loads(response.text)
-            except Exception as e:
-                parsed = None
-                st.error(f"Gemini error: {e}")
+            parsed, model_used, error_message = call_gemini(history_contents, current_turn_content, reply_prompt)
+            if error_message:
+                st.error(f"Gemini error: {error_message}")
+            elif model_used and model_used != GEMINI_MODELS[0]:
+                st.caption(f"⚠️ Fell back to `{model_used}` (primary model was overloaded or unavailable).")
 
         t1 = time.perf_counter()  # after STT + reasoning
         stt_llm_ms = (t1 - t0) * 1000
