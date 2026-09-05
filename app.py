@@ -16,7 +16,7 @@ st.set_page_config(page_title="Low-Latency Voice Assistant", page_icon="⚡")
 st.title("⚡ Low-Latency Voice Assistant")
 st.caption("Speak, and get a spoken reply back — every stage is timed so the latency claim is measured, not just asserted.")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 RIME_MODEL = "mistv3"  # Rime's fastest, lowest-latency English model
 RIME_TTS_URL = "https://users.rime.ai/v1/rime-tts"
 RIME_VOICES_URL = "https://users.rime.ai/data/voices/voice_details.json"
