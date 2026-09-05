@@ -1,0 +1,38 @@
+[
+  {
+    "timestamp": "2026-09-05T13:42:38",
+    "transcript": "Respond to this.",
+    "reply": "I'm ready to respond. What would you like me to do?",
+    "audio_file": "20260905_134238_869255.wav",
+    "stt_llm_ms": 3191.8,
+    "tts_ms": 2593.8,
+    "total_ms": 5792.6
+  },
+  {
+    "timestamp": "2026-09-05T13:43:13",
+    "transcript": "ex-chief minister of West Bengal.",
+    "reply": "Are you referring to Buddhadeb Bhattacharjee?",
+    "audio_file": "20260905_134313_256528.wav",
+    "stt_llm_ms": 3458.3,
+    "tts_ms": 3500.0,
+    "total_ms": 6964.6
+  },
+  {
+    "timestamp": "2026-09-05T13:43:47",
+    "transcript": "No, it's Mamta Banerjee.",
+    "reply": "I heard you say Mamta Banerjee; how can I help?",
+    "audio_file": "20260905_134347_325194.wav",
+    "stt_llm_ms": 3394.1,
+    "tts_ms": 2324.5,
+    "total_ms": 5747.4
+  },
+  {
+    "timestamp": "2026-09-05T13:44:12",
+    "transcript": "Mamta Banerjee is the ex-chief minister of West Bengal. It's not Buradev Butacharji.",
+    "reply": "You are correct, Mamata Banerjee is the former chief minister of West Bengal.",
+    "audio_file": "20260905_134412_127092.wav",
+    "stt_llm_ms": 3896.0,
+    "tts_ms": 2380.6,
+    "total_ms": 6282.4
+  }
+]

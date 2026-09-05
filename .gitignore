@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+conversations.json
+benchmark_history.json
+audio_history/
