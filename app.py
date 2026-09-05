@@ -2,6 +2,7 @@ import os
 import time
 import json
 import uuid
+import base64
 from datetime import datetime
 
 import requests
@@ -9,6 +10,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from pymongo import MongoClient
 
 st.set_page_config(page_title="Low-Latency Voice Assistant", page_icon="⚡")
 st.title("⚡ Low-Latency Voice Assistant")
@@ -19,101 +21,117 @@ RIME_MODEL = "mistv3"  # Rime's fastest, lowest-latency English model
 RIME_TTS_URL = "https://users.rime.ai/v1/rime-tts"
 RIME_VOICES_URL = "https://users.rime.ai/data/voices/voice_details.json"
 SAMPLING_RATE = 22050  # lower than default 44100 -> smaller payload -> faster network transfer
-
-CONVERSATIONS_FILE = "conversations.json"
-BENCHMARK_HISTORY_FILE = "benchmark_history.json"
-AUDIO_HISTORY_DIR = "audio_history"
-
-os.makedirs(AUDIO_HISTORY_DIR, exist_ok=True)
-
-
-def load_json_file(path: str, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
-
-
-def save_json_file(path: str, data) -> None:
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        st.error(f"Could not save to {path}: {e}")
-
-
-def create_new_conversation() -> str:
-    """Create a new empty conversation, make it active, persist it, return its id."""
-    conv_id = str(uuid.uuid4())
-    st.session_state.conversations[conv_id] = {
-        "title": "New conversation",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "turns": [],
-    }
-    os.makedirs(os.path.join(AUDIO_HISTORY_DIR, conv_id), exist_ok=True)
-    st.session_state.active_conversation_id = conv_id
-    save_json_file(CONVERSATIONS_FILE, st.session_state.conversations)
-    return conv_id
-
-
-def delete_conversation(conv_id: str) -> None:
-    """Delete one conversation and its saved audio files. Never touches others."""
-    st.session_state.conversations.pop(conv_id, None)
-    save_json_file(CONVERSATIONS_FILE, st.session_state.conversations)
-    conv_audio_dir = os.path.join(AUDIO_HISTORY_DIR, conv_id)
-    if os.path.exists(conv_audio_dir):
-        for fname in os.listdir(conv_audio_dir):
-            try:
-                os.remove(os.path.join(conv_audio_dir, fname))
-            except Exception:
-                pass
-        try:
-            os.rmdir(conv_audio_dir)
-        except Exception:
-            pass
-    if st.session_state.active_conversation_id == conv_id:
-        remaining = list(st.session_state.conversations.keys())
-        st.session_state.active_conversation_id = remaining[0] if remaining else None
-
+DB_NAME = "voice_assistant"
 
 # ---------------------------------------------------------------------------
-# Load persisted conversations on startup
-# ---------------------------------------------------------------------------
-if "conversations" not in st.session_state:
-    st.session_state.conversations = load_json_file(CONVERSATIONS_FILE, {})
-
-if "active_conversation_id" not in st.session_state:
-    existing_ids = list(st.session_state.conversations.keys())
-    st.session_state.active_conversation_id = existing_ids[0] if existing_ids else None
-
-if st.session_state.active_conversation_id is None:
-    create_new_conversation()
-
-# ---------------------------------------------------------------------------
-# API keys — read only from .env, never typed into the app
+# API keys / connection string — read only from .env, never typed into the app
 # ---------------------------------------------------------------------------
 load_dotenv()
 gemini_key = os.environ.get("GEMINI_API_KEY", "")
 rime_key = os.environ.get("RIME_API_KEY", "")
+mongodb_uri = os.environ.get("MONGODB_URI", "")
 
 missing = []
 if not gemini_key:
     missing.append("GEMINI_API_KEY")
 if not rime_key:
     missing.append("RIME_API_KEY")
+if not mongodb_uri:
+    missing.append("MONGODB_URI")
 
 if missing:
     st.error(
         f"Missing: {', '.join(missing)}.\n\n"
         "Create a `.env` file next to this script with:\n\n"
-        "```\nGEMINI_API_KEY=your-gemini-key\nRIME_API_KEY=your-rime-key\n```"
+        "```\nGEMINI_API_KEY=your-gemini-key\nRIME_API_KEY=your-rime-key\n"
+        "MONGODB_URI=your-mongodb-atlas-connection-string\n```"
     )
     st.stop()
 
 gemini_client = genai.Client(api_key=gemini_key)
+
+
+@st.cache_resource
+def get_db():
+    client = MongoClient(mongodb_uri)
+    return client[DB_NAME]
+
+db = get_db()
+conversations_col = db["conversations"]
+turns_col = db["turns"]
+benchmark_col = db["benchmark_runs"]
+
+
+# ---------------------------------------------------------------------------
+# Conversation CRUD — all persisted to MongoDB, survives Streamlit Cloud
+# sleep/wake cycles and redeploys, unlike local files
+# ---------------------------------------------------------------------------
+def create_new_conversation() -> str:
+    conv_id = str(uuid.uuid4())
+    conversations_col.insert_one({
+        "_id": conv_id,
+        "title": "New conversation",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    st.session_state.active_conversation_id = conv_id
+    return conv_id
+
+
+def delete_conversation(conv_id: str) -> None:
+    """Delete one conversation and its turns. Never touches other conversations."""
+    conversations_col.delete_one({"_id": conv_id})
+    turns_col.delete_many({"conversation_id": conv_id})
+    if st.session_state.active_conversation_id == conv_id:
+        remaining = list(conversations_col.find().sort("created_at", -1))
+        st.session_state.active_conversation_id = remaining[0]["_id"] if remaining else None
+
+
+def list_conversations():
+    return list(conversations_col.find().sort("created_at", -1))
+
+
+def get_turns(conv_id: str):
+    return list(turns_col.find({"conversation_id": conv_id}).sort("timestamp", 1))
+
+
+def add_turn(conv_id: str, transcript: str, reply: str, audio_bytes: bytes | None,
+             stt_llm_ms: float, tts_ms: float, total_ms: float) -> None:
+    turns_col.insert_one({
+        "conversation_id": conv_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "transcript": transcript,
+        "reply": reply,
+        "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
+        "stt_llm_ms": round(stt_llm_ms, 1),
+        "tts_ms": round(tts_ms, 1),
+        "total_ms": round(total_ms, 1),
+    })
+    # Auto-title the conversation from its first turn, like a real chat app.
+    # Only fires while the title is still the default, so it never overwrites
+    # a title from a later turn.
+    if transcript:
+        title = transcript[:40] + ("…" if len(transcript) > 40 else "")
+        conversations_col.update_one(
+            {"_id": conv_id, "title": "New conversation"},
+            {"$set": {"title": title}},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Active conversation bootstrap
+# ---------------------------------------------------------------------------
+if "active_conversation_id" not in st.session_state:
+    existing = list_conversations()
+    st.session_state.active_conversation_id = existing[0]["_id"] if existing else None
+
+if st.session_state.active_conversation_id is None:
+    create_new_conversation()
+
+if "last_audio_id" not in st.session_state:
+    st.session_state.last_audio_id = None
+
+if "audio_input_counter" not in st.session_state:
+    st.session_state.audio_input_counter = 0
 
 # ---------------------------------------------------------------------------
 # Fetch Rime's LIVE voice catalog and pick one mistv3 English speaker at
@@ -137,47 +155,6 @@ def get_mistv3_speaker(_api_key: str) -> str | None:
     return None
 
 speaker = get_mistv3_speaker(rime_key)
-
-with st.sidebar:
-    st.subheader("🔊 Active speech provider")
-    st.markdown(f"**Provider:** Rime\n\n**Model:** `{RIME_MODEL}` (fastest, lowest-latency)")
-    if speaker:
-        st.success(f"Voice: `{speaker}`")
-    else:
-        st.error("No live mistv3 voice found — check your Rime dashboard and hardcode a fallback speaker name.")
-
-    st.divider()
-    st.subheader("💬 Conversations")
-
-    if st.button("➕ New conversation", use_container_width=True):
-        create_new_conversation()
-        st.rerun()
-
-    st.divider()
-
-    # List conversations, most recently created first
-    sorted_convs = sorted(
-        st.session_state.conversations.items(),
-        key=lambda kv: kv[1].get("created_at", ""),
-        reverse=True,
-    )
-    for conv_id, conv in sorted_convs:
-        is_active = conv_id == st.session_state.active_conversation_id
-        col_select, col_delete = st.columns([4, 1])
-        with col_select:
-            label = ("👉 " if is_active else "") + conv.get("title", "New conversation")
-            if st.button(label, key=f"select_{conv_id}", use_container_width=True):
-                st.session_state.active_conversation_id = conv_id
-                st.rerun()
-        with col_delete:
-            if st.button("🗑️", key=f"delete_{conv_id}", help="Delete this conversation"):
-                delete_conversation(conv_id)
-                if not st.session_state.conversations:
-                    create_new_conversation()
-                st.rerun()
-
-if "last_audio_id" not in st.session_state:
-    st.session_state.last_audio_id = None
 
 
 def synthesize_speech(text: str) -> tuple[bytes | None, float]:
@@ -211,13 +188,47 @@ def synthesize_speech(text: str) -> tuple[bytes | None, float]:
 
 
 # ---------------------------------------------------------------------------
+# Sidebar: speech provider status + conversation switcher
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.subheader("🔊 Active speech provider")
+    st.markdown(f"**Provider:** Rime\n\n**Model:** `{RIME_MODEL}` (fastest, lowest-latency)")
+    if speaker:
+        st.success(f"Voice: `{speaker}`")
+    else:
+        st.error("No live mistv3 voice found — check your Rime dashboard and hardcode a fallback speaker name.")
+
+    st.divider()
+    st.subheader("💬 Conversations")
+
+    if st.button("➕ New conversation", use_container_width=True):
+        create_new_conversation()
+        st.rerun()
+
+    st.divider()
+
+    for conv in list_conversations():
+        conv_id = conv["_id"]
+        is_active = conv_id == st.session_state.active_conversation_id
+        col_select, col_delete = st.columns([4, 1])
+        with col_select:
+            label = ("👉 " if is_active else "") + conv.get("title", "New conversation")
+            if st.button(label, key=f"select_{conv_id}", use_container_width=True):
+                st.session_state.active_conversation_id = conv_id
+                st.rerun()
+        with col_delete:
+            if st.button("🗑️", key=f"delete_{conv_id}", help="Delete this conversation"):
+                delete_conversation(conv_id)
+                if not list_conversations():
+                    create_new_conversation()
+                st.rerun()
+
+# ---------------------------------------------------------------------------
 # Voice turn — appends to the ACTIVE conversation only
 # ---------------------------------------------------------------------------
-active_conv = st.session_state.conversations[st.session_state.active_conversation_id]
+active_conv_id = st.session_state.active_conversation_id
+active_conv = conversations_col.find_one({"_id": active_conv_id})
 st.subheader(f"🗨️ {active_conv.get('title', 'New conversation')}")
-
-if "audio_input_counter" not in st.session_state:
-    st.session_state.audio_input_counter = 0
 
 if st.button("🎤 New message", use_container_width=True):
     st.session_state.audio_input_counter += 1
@@ -252,9 +263,11 @@ if audio_value is not None:
             )
 
             # Build multi-turn history from prior turns in THIS conversation,
-            # so Gemini has context instead of treating each turn in isolation.
+            # loaded from MongoDB, so Gemini has context instead of treating
+            # each turn in isolation.
+            prior_turns = get_turns(active_conv_id)
             history_contents = []
-            for past_turn in active_conv["turns"]:
+            for past_turn in prior_turns:
                 if past_turn.get("transcript"):
                     history_contents.append(
                         types.Content(role="user", parts=[types.Part.from_text(text=past_turn["transcript"])])
@@ -299,38 +312,15 @@ if audio_value is not None:
             t2 = time.perf_counter()  # after TTS bytes received
             total_ms = (t2 - t0) * 1000
 
-            # Save the actual reply audio to disk, scoped to this conversation
-            conv_id = st.session_state.active_conversation_id
-            turn_ts = datetime.now()
-            audio_filename = None
-            if audio_reply:
-                audio_filename = f"{turn_ts.strftime('%Y%m%d_%H%M%S_%f')}.wav"
-                conv_audio_dir = os.path.join(AUDIO_HISTORY_DIR, conv_id)
-                os.makedirs(conv_audio_dir, exist_ok=True)
-                audio_path = os.path.join(conv_audio_dir, audio_filename)
-                try:
-                    with open(audio_path, "wb") as f:
-                        f.write(audio_reply)
-                except Exception as e:
-                    st.warning(f"Could not save audio to history: {e}")
-                    audio_filename = None
-
-            turn_record = {
-                "timestamp": turn_ts.isoformat(timespec="seconds"),
-                "transcript": parsed.get("transcript", ""),
-                "reply": parsed["reply"],
-                "audio_file": audio_filename,
-                "stt_llm_ms": round(stt_llm_ms, 1),
-                "tts_ms": round(tts_ms, 1),
-                "total_ms": round(total_ms, 1),
-            }
-
-            conv = st.session_state.conversations[conv_id]
-            conv["turns"].append(turn_record)
-            # auto-title the conversation from its first turn, like a real chat app
-            if conv["title"] == "New conversation" and turn_record["transcript"]:
-                conv["title"] = turn_record["transcript"][:40] + ("…" if len(turn_record["transcript"]) > 40 else "")
-            save_json_file(CONVERSATIONS_FILE, st.session_state.conversations)
+            add_turn(
+                active_conv_id,
+                transcript=parsed.get("transcript", ""),
+                reply=parsed["reply"],
+                audio_bytes=audio_reply,
+                stt_llm_ms=stt_llm_ms,
+                tts_ms=tts_ms,
+                total_ms=total_ms,
+            )
 
             st.markdown(f"**You said:** {parsed.get('transcript', '')}")
             st.markdown(f"**Reply:** {parsed['reply']}")
@@ -343,27 +333,21 @@ if audio_value is not None:
             c3.metric("Total (turn end → audio ready)", f"{total_ms:.0f} ms")
 
 # ---------------------------------------------------------------------------
-# This conversation's history — chat-style, with replayable audio
+# This conversation's history — chat-style, with replayable audio, loaded
+# fresh from MongoDB every run so it survives Streamlit Cloud restarts
 # ---------------------------------------------------------------------------
-active_conv = st.session_state.conversations[st.session_state.active_conversation_id]  # re-fetch after possible update
-if active_conv["turns"]:
+turns = get_turns(active_conv_id)
+if turns:
     st.divider()
-    st.subheader(f"💬 History ({len(active_conv['turns'])} turns in this conversation)")
+    st.subheader(f"💬 History ({len(turns)} turns in this conversation)")
 
-    conv_audio_dir = os.path.join(AUDIO_HISTORY_DIR, st.session_state.active_conversation_id)
-    for turn in active_conv["turns"]:
+    for turn in turns:
         with st.chat_message("user"):
             st.markdown(turn.get("transcript", ""))
         with st.chat_message("assistant"):
             st.markdown(turn.get("reply", ""))
-            audio_filename = turn.get("audio_file")
-            if audio_filename:
-                audio_path = os.path.join(conv_audio_dir, audio_filename)
-                if os.path.exists(audio_path):
-                    with open(audio_path, "rb") as f:
-                        st.audio(f.read(), format="audio/wav")
-                else:
-                    st.caption("⚠️ Saved audio file missing on disk.")
+            if turn.get("audio_b64"):
+                st.audio(base64.b64decode(turn["audio_b64"]), format="audio/wav")
             st.caption(
                 f"{turn.get('timestamp', '')} · STT+LLM {turn.get('stt_llm_ms', 0):.0f}ms · "
                 f"TTS {turn.get('tts_ms', 0):.0f}ms · Total {turn.get('total_ms', 0):.0f}ms"
@@ -372,7 +356,7 @@ if active_conv["turns"]:
 # ---------------------------------------------------------------------------
 # Repeatable TTS-only benchmark (isolates network + model latency from the
 # rest of the pipeline; distinguishes cold vs warm runs, per Rime's own
-# evidence guidance)
+# evidence guidance). Also stored in MongoDB for persistence.
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("🧪 Repeatable TTS-only benchmark")
@@ -383,8 +367,6 @@ num_runs = st.slider("Number of runs", min_value=1, max_value=10, value=5)
 
 if "benchmark_results" not in st.session_state:
     st.session_state.benchmark_results = None
-if "benchmark_history" not in st.session_state:
-    st.session_state.benchmark_history = load_json_file(BENCHMARK_HISTORY_FILE, [])
 
 col_run, col_reset = st.columns([3, 1])
 with col_run:
@@ -401,13 +383,11 @@ if run_clicked:
         progress.progress((i + 1) / num_runs)
     st.session_state.benchmark_results = results
 
-    # Persist this batch to the running benchmark history file
-    st.session_state.benchmark_history.append({
+    benchmark_col.insert_one({
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "phrase": bench_text,
         "runs": results,
     })
-    save_json_file(BENCHMARK_HISTORY_FILE, st.session_state.benchmark_history)
 
 if reset_clicked:
     st.session_state.benchmark_results = None
@@ -421,13 +401,13 @@ if st.session_state.benchmark_results:
         st.metric("Avg warm-run latency", f"{sum(warm_runs)/len(warm_runs):.0f} ms")
     st.metric("Cold-run latency (run 1)", f"{results[0]['latency_ms']:.0f} ms")
 
-if st.session_state.benchmark_history:
-    with st.expander(f"📜 Benchmark history ({len(st.session_state.benchmark_history)} batches, saved to {BENCHMARK_HISTORY_FILE})"):
-        for batch in reversed(st.session_state.benchmark_history):
+benchmark_batches = list(benchmark_col.find().sort("timestamp", -1))
+if benchmark_batches:
+    with st.expander(f"📜 Benchmark history ({len(benchmark_batches)} batches, stored in MongoDB)"):
+        for batch in benchmark_batches:
             st.markdown(f"**{batch['timestamp']}** — \"{batch['phrase']}\"")
             st.table(batch["runs"])
             st.divider()
         if st.button("🗑️ Clear all benchmark history"):
-            st.session_state.benchmark_history = []
-            save_json_file(BENCHMARK_HISTORY_FILE, [])
+            benchmark_col.delete_many({})
             st.rerun()
