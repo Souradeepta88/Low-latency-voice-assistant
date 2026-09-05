@@ -294,7 +294,7 @@ if audio_value is not None:
                         temperature=0.4,
                         max_output_tokens=120,
                         response_mime_type="application/json",
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        thinking_config=types.ThinkingConfig(thinking_budget="minimal"),
                     ),
                 )
                 parsed = json.loads(response.text)
